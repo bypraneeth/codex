@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::path::Path;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use serde_json::Value;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::responses_metadata::AGENT_NAME_KEY;
 use crate::responses_metadata::CodexResponsesMetadata;
@@ -28,7 +28,6 @@ use crate::sandbox_tags::SandboxTags;
 use crate::sandbox_tags::record_policy_metadata;
 use codex_git_utils::SanitizedGitUrl;
 use codex_git_utils::get_git_remote_urls_assume_git_repo;
-use codex_git_utils::get_git_repo_root;
 use codex_git_utils::get_has_changes_in_repo;
 use codex_git_utils::get_head_commit_hash;
 use codex_protocol::AgentPath;
@@ -40,8 +39,13 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_git_discovery::GitRootDiscovery;
+
+// Memory requests await this optional metadata before sending their model request.
+const MEMORY_GIT_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 const MODEL_KEY: &str = "model";
+const CODEX_VERSION_KEY: &str = "codex_version";
 const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const USER_INPUT_REQUESTED_DURING_TURN_KEY: &str = "user_input_requested_during_turn";
 const WORKSPACE_KIND_KEY: &str = "workspace_kind";
@@ -79,6 +83,7 @@ impl From<WorkspaceGitMetadata> for TurnMetadataWorkspace {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn detached_memory_responses_metadata(
+    thread_manager: &crate::ThreadManager,
     installation_id: String,
     session_id: String,
     thread_id: String,
@@ -88,12 +93,20 @@ pub async fn detached_memory_responses_metadata(
     permission_profile: &PermissionProfile,
     sandbox: Option<&str>,
 ) -> CodexResponsesMetadata {
+    let turn_id = uuid::Uuid::now_v7().to_string();
     let mut metadata = CodexResponsesMetadata {
+        turn_id: Some(turn_id.clone()),
+        root_turn_id: Some(turn_id),
         request_kind: Some(CodexResponsesRequestKind::Memory),
         thread_source: Some(ThreadSource::MemoryConsolidation),
+        turn_trigger: Some("memory_consolidation".to_owned()),
         subagent_header: subagent_header_value(session_source),
         sandbox: sandbox.map(ToString::to_string),
-        workspaces: memory_workspaces(cwd).await,
+        workspaces: memory_workspaces(
+            cwd,
+            thread_manager.git_root_discovery().discover(cwd.clone()),
+        )
+        .await,
         ..CodexResponsesMetadata::new(installation_id, session_id, thread_id, window_id)
     };
     record_policy_metadata(permission_profile, cwd.as_path(), &mut metadata);
@@ -103,7 +116,6 @@ pub async fn detached_memory_responses_metadata(
 #[derive(Debug)]
 pub(crate) struct TurnMetadataState {
     cwd: AbsolutePathBuf,
-    repo_root: Option<PathBuf>,
     session_id: String,
     thread_id: String,
     agent_name: String,
@@ -129,7 +141,7 @@ pub(crate) struct TurnMetadataState {
     responses_api_metadata: RwLock<BTreeMap<String, String>>,
     responsesapi_client_metadata: RwLock<BTreeMap<String, String>>,
     user_input_requested_during_turn: AtomicBool,
-    enrichment_task: Mutex<Option<JoinHandle<()>>>,
+    enrichment_task: Mutex<Option<AbortOnDropHandle<()>>>,
     git_enrichment_complete: watch::Sender<bool>,
 }
 
@@ -180,7 +192,6 @@ impl TurnMetadataState {
         auto_review_enabled: bool,
         model_info: &ModelInfo,
     ) -> Self {
-        let repo_root = get_git_repo_root(&cwd);
         let sandbox_tags = SandboxTags::new(
             permission_profile,
             cwd.as_path(),
@@ -193,7 +204,6 @@ impl TurnMetadataState {
             .to_string();
         Self {
             cwd,
-            repo_root,
             session_id,
             thread_id,
             agent_name,
@@ -209,7 +219,7 @@ impl TurnMetadataState {
             turn_id,
             sandbox_tags,
             auto_review_enabled,
-            node_repl_auto_review_required: model_info.node_repl_auto_review_required,
+            node_repl_auto_review_required: model_info.computer_use_review_required(),
             node_repl_disabled: model_info.node_repl_disabled,
             enriched_workspaces: RwLock::new(None),
             tool_namespaces_info: RwLock::new(None),
@@ -240,6 +250,10 @@ impl TurnMetadataState {
         metadata.insert(
             MODEL_KEY.to_string(),
             Value::String(context.model.to_string()),
+        );
+        metadata.insert(
+            CODEX_VERSION_KEY.to_string(),
+            Value::String(env!("CARGO_PKG_VERSION").to_string()),
         );
         match context.reasoning_effort {
             Some(reasoning_effort) => {
@@ -330,24 +344,6 @@ impl TurnMetadataState {
         self.root_turn_id.get().cloned()
     }
 
-    pub(crate) fn can_start_root_turn(&self, session_source: &SessionSource) -> bool {
-        if session_source.is_non_root_agent() {
-            return false;
-        }
-        match &self.thread_source {
-            // Desktop create/fork/send lacks trusted app-server provenance; fail closed.
-            Some(
-                ThreadSource::Subagent
-                | ThreadSource::GuardianReview
-                | ThreadSource::MemoryConsolidation,
-            ) => false,
-            Some(ThreadSource::Feature(feature)) => {
-                !matches!(feature.as_str(), "system" | "title") && !feature.starts_with("ambient")
-            }
-            Some(ThreadSource::User) | None => true,
-        }
-    }
-
     pub(crate) fn set_responsesapi_client_metadata(
         &self,
         responsesapi_client_metadata: HashMap<String, String>,
@@ -398,6 +394,14 @@ impl TurnMetadataState {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // Extract Guardian's internal parent before filtering configured metadata keys.
+        // Ordinary app-server client metadata stays in `extra`.
+        let parent_response_id =
+            if self.subagent_header.as_deref() == Some(crate::guardian::GUARDIAN_REVIEWER_NAME) {
+                extra.remove("parent_response_id")
+            } else {
+                None
+            };
         for key in self
             .responses_api_metadata
             .read()
@@ -407,6 +411,7 @@ impl TurnMetadataState {
             extra.remove(key);
         }
         let mut metadata = CodexResponsesMetadata {
+            parent_response_id,
             turn_id: Some(self.turn_id.clone()),
             agent_name: Some(self.agent_name.clone()),
             forked_from_thread_id: self.forked_from_thread_id,
@@ -461,11 +466,10 @@ impl TurnMetadataState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(turn_started_at_unix_ms);
     }
 
-    pub(crate) fn spawn_git_enrichment_task(self: &Arc<Self>) {
-        let Some(repo_root) = self.repo_root.clone() else {
-            return;
-        };
-
+    pub(crate) fn spawn_git_enrichment_task(
+        self: &Arc<Self>,
+        git_root_discovery: Arc<GitRootDiscovery>,
+    ) {
         let mut task_guard = self
             .enrichment_task
             .lock()
@@ -475,16 +479,16 @@ impl TurnMetadataState {
         }
 
         self.git_enrichment_complete.send_replace(/*value*/ false);
-        let state = Arc::clone(self);
-        *task_guard = Some(tokio::spawn(async move {
-            let workspace_git_metadata = state.fetch_workspace_git_metadata(&repo_root).await;
-
-            if !workspace_git_metadata.is_empty() {
-                let mut workspaces = BTreeMap::new();
-                workspaces.insert(
-                    repo_root.to_string_lossy().into_owned(),
-                    workspace_git_metadata.into(),
-                );
+        // History-only contexts have no active task to cancel enrichment. Keep the
+        // state weak across awaits so dropping its last owner aborts this waiter.
+        let state = Arc::downgrade(self);
+        let cwd = self.cwd.clone();
+        *task_guard = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            let workspaces = git_workspaces(&cwd, git_root_discovery.discover(cwd.clone())).await;
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if !workspaces.is_empty() {
                 *state
                     .enriched_workspaces
                     .write()
@@ -492,7 +496,7 @@ impl TurnMetadataState {
             }
 
             state.git_enrichment_complete.send_replace(/*value*/ true);
-        }));
+        })));
     }
 
     pub(crate) async fn wait_for_git_enrichment(&self) {
@@ -510,25 +514,22 @@ impl TurnMetadataState {
             self.git_enrichment_complete.send_replace(/*value*/ true);
         }
     }
-
-    async fn fetch_workspace_git_metadata(&self, repo_root: &Path) -> WorkspaceGitMetadata {
-        let (head_commit_hash, associated_remote_urls, has_changes) = tokio::join!(
-            get_head_commit_hash(&self.cwd),
-            get_git_remote_urls_assume_git_repo(&self.cwd),
-            get_has_changes_in_repo(&self.cwd, repo_root),
-        );
-        let latest_git_commit_hash = head_commit_hash.map(|sha| sha.0);
-
-        WorkspaceGitMetadata {
-            associated_remote_urls,
-            latest_git_commit_hash,
-            has_changes,
-        }
-    }
 }
 
-async fn memory_workspaces(cwd: &AbsolutePathBuf) -> BTreeMap<String, TurnMetadataWorkspace> {
-    let Some(repo_root) = get_git_repo_root(cwd) else {
+async fn memory_workspaces(
+    cwd: &AbsolutePathBuf,
+    repo_root: impl Future<Output = Option<PathBuf>>,
+) -> BTreeMap<String, TurnMetadataWorkspace> {
+    tokio::time::timeout(MEMORY_GIT_METADATA_TIMEOUT, git_workspaces(cwd, repo_root))
+        .await
+        .unwrap_or_default()
+}
+
+async fn git_workspaces(
+    cwd: &AbsolutePathBuf,
+    repo_root: impl Future<Output = Option<PathBuf>>,
+) -> BTreeMap<String, TurnMetadataWorkspace> {
+    let Some(repo_root) = repo_root.await else {
         return BTreeMap::new();
     };
     let (head_commit_hash, associated_remote_urls, has_changes) = tokio::join!(

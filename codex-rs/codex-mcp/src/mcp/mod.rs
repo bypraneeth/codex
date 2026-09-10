@@ -41,6 +41,7 @@ use codex_protocol::mcp::Tool;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::McpAuthStatus;
+use codex_rmcp_client::McpOAuthRefreshMode;
 use codex_utils_path_uri::PathUri;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::ReadResourceRequestParams;
@@ -128,6 +129,8 @@ pub struct McpConfig {
     pub codex_home: PathBuf,
     /// Preferred credential store for MCP OAuth tokens.
     pub mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode,
+    /// OAuth refresh ownership selected for new MCP connections.
+    pub oauth_refresh_mode: McpOAuthRefreshMode,
     /// Backend used when MCP OAuth storage is configured for keyring-backed persistence.
     pub auth_keyring_backend_kind: AuthKeyringBackendKind,
     /// Optional fixed localhost callback port for MCP OAuth login.
@@ -169,8 +172,10 @@ pub struct McpConfig {
     pub prefix_mcp_tool_names: bool,
     /// MCP servers whose model-visible tool namespaces omit the `mcp__` prefix.
     pub non_prefixed_mcp_tool_servers: Vec<String>,
-    /// Protocol compatibility policy captured when this MCP configuration is created.
+    /// Protocol mode for servers other than the host-owned Codex Apps registration.
     pub protocol_mode: McpProtocolMode,
+    /// Independent protocol mode for the trusted, HTTP Codex Apps registration.
+    pub host_owned_apps_protocol_mode: McpProtocolMode,
     /// Client-side elicitation capabilities advertised during MCP initialization.
     pub client_elicitation_capability: ElicitationCapability,
     /// Resolved MCP registrations keyed by logical server name.
@@ -456,6 +461,7 @@ pub async fn read_mcp_resource(
 pub struct McpServerStatusSnapshot {
     pub server_infos: HashMap<String, McpServerInfo>,
     pub tools_by_server: HashMap<String, HashMap<String, Tool>>,
+    pub tools_errors: HashMap<String, String>,
     pub resources: HashMap<String, Vec<Resource>>,
     pub resource_templates: HashMap<String, Vec<ResourceTemplate>>,
     pub auth_statuses: HashMap<String, McpAuthStatus>,
@@ -476,6 +482,7 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         return McpServerStatusSnapshot {
             server_infos: HashMap::new(),
             tools_by_server: HashMap::new(),
+            tools_errors: HashMap::new(),
             resources: HashMap::new(),
             resource_templates: HashMap::new(),
             auth_statuses: HashMap::new(),
@@ -758,10 +765,10 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     server_names: Vec<String>,
     detail: McpSnapshotDetail,
 ) -> McpServerStatusSnapshot {
-    let ((server_infos, tools), resources, resource_templates) = tokio::join!(
+    let ((server_infos, (tools, tools_errors)), resources, resource_templates) = tokio::join!(
         async {
             let server_infos = mcp_connection_manager.list_available_server_infos().await;
-            let tools = mcp_connection_manager.list_all_tools().await;
+            let tools = mcp_connection_manager.list_tools_with_errors().await;
             (server_infos, tools)
         },
         async {
@@ -795,12 +802,22 @@ async fn collect_mcp_server_status_snapshot_from_manager(
             .insert(tool_name, tool);
     }
 
+    // Status-only discovery has no event channel. Report OAuth failures from the completed
+    // connection attempt instead of retaining the credential-presence status read beforehand.
+    let mut auth_statuses = auth_statuses_from_entries(&auth_status_entries);
+    for server_name in mcp_connection_manager.authentication_failed_servers().await {
+        if auth_statuses.get(&server_name) == Some(&McpAuthStatus::OAuth) {
+            auth_statuses.insert(server_name, McpAuthStatus::NotLoggedIn);
+        }
+    }
+
     McpServerStatusSnapshot {
         server_infos,
         tools_by_server,
+        tools_errors,
         resources: convert_mcp_resources(resources),
         resource_templates: convert_mcp_resource_templates(resource_templates),
-        auth_statuses: auth_statuses_from_entries(&auth_status_entries),
+        auth_statuses,
         server_names,
     }
 }

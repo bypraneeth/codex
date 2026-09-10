@@ -7,6 +7,10 @@ use super::InternalChatMessageMetadataPassthrough;
 use super::ResponseItem;
 
 const MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES: usize = 8 * 1024;
+/// Maximum distinct result sources retained for one tool invocation.
+const MAX_TOOL_RESULT_SOURCES: usize = 32;
+/// Maximum UTF-8 bytes for each source's `type` and `id` separately, not the source list.
+pub const MAX_TOOL_RESULT_SOURCE_FIELD_BYTES: usize = 128;
 /// Maximum serialized warehouse-only attempted-tool metadata in one request.
 const MAX_EXECUTED_TOOL_CALL_METADATA_BYTES: usize = 32 * 1024;
 const EXECUTED_TOOL_CALL_METADATA_FIELD_BYTES: usize = b"\"executed_tool_calls\":".len();
@@ -54,6 +58,18 @@ pub fn executed_tool_call_metadata_bytes(item: &ResponseItem) -> usize {
                 .unwrap_or(usize::MAX)
         })
         .saturating_add(executed_tool_call_metadata_field_bytes(metadata))
+}
+
+impl InternalChatMessageMetadataPassthrough {
+    /// Compares call order, names and arguments, ignoring optional result metadata.
+    pub fn has_same_tool_calls(&self, calls: &[ExecutedToolCall]) -> bool {
+        self.executed_tool_calls.as_ref().is_some_and(|recorded| {
+            recorded.len() == calls.len()
+                && recorded.iter().zip(calls).all(|(recorded, call)| {
+                    recorded.name == call.name && recorded.arguments() == call.arguments()
+                })
+        })
+    }
 }
 
 /// Bounds attempted-tool metadata fairly across the complete serialized request.
@@ -110,6 +126,52 @@ fn bound_executed_tool_calls_for_prompt_with_priority(
         remaining_items += 1;
         original_metadata_bytes =
             original_metadata_bytes.saturating_add(executed_tool_call_metadata_bytes(item));
+    }
+
+    // Raw result metadata must not displace existing source evidence, calls or completion proof.
+    if original_metadata_bytes > MAX_EXECUTED_TOOL_CALL_METADATA_BYTES {
+        original_metadata_bytes = 0;
+        for item in items.iter_mut() {
+            if let Some(metadata) = item
+                .internal_chat_message_metadata_passthrough_mut()
+                .and_then(Option::as_mut)
+            {
+                for call in metadata.executed_tool_calls.iter_mut().flatten() {
+                    if call.tool_result_metadata.is_some() {
+                        call.tool_result_metadata = ToolResultMetadata::omitted_due_to_size_limit();
+                    }
+                }
+            }
+            original_metadata_bytes =
+                original_metadata_bytes.saturating_add(executed_tool_call_metadata_bytes(item));
+        }
+    }
+
+    // Omission markers are optional too; keep the original call budget if they cannot fit.
+    if original_metadata_bytes > MAX_EXECUTED_TOOL_CALL_METADATA_BYTES {
+        original_metadata_bytes = 0;
+        for item in items.iter_mut() {
+            item.clear_tool_result_metadata();
+            original_metadata_bytes =
+                original_metadata_bytes.saturating_add(executed_tool_call_metadata_bytes(item));
+        }
+    }
+
+    // Source evidence is optional; dropping it must not discard calls or their completion proof.
+    if original_metadata_bytes > MAX_EXECUTED_TOOL_CALL_METADATA_BYTES {
+        original_metadata_bytes = 0;
+        for item in items.iter_mut() {
+            if let Some(metadata) = item
+                .internal_chat_message_metadata_passthrough_mut()
+                .and_then(Option::as_mut)
+            {
+                for call in metadata.executed_tool_calls.iter_mut().flatten() {
+                    call.tool_result_sources = None;
+                }
+            }
+            original_metadata_bytes =
+                original_metadata_bytes.saturating_add(executed_tool_call_metadata_bytes(item));
+        }
     }
 
     // A terminal marker can be on an empty wait output, separate from the lost calls.
@@ -298,6 +360,119 @@ pub struct ExecutedToolCall {
     pub name: String,
     #[ts(type = "unknown")]
     arguments: ExecutedToolCallArguments,
+    /// Host-generated analytics only: ignore input JSON rather than accepting caller-supplied
+    /// evidence, and keep this out of public schemas and generated clients.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    tool_result_sources: Option<Vec<ToolResultSource>>,
+    /// Raw MCP result metadata is host-recorded only, never trusted from input JSON or exposed
+    /// in public schemas. Its Debug implementation also prevents raw values reaching logs.
+    #[serde(
+        default,
+        skip_deserializing,
+        skip_serializing_if = "ToolResultMetadata::is_none"
+    )]
+    #[schemars(skip)]
+    #[ts(skip)]
+    tool_result_metadata: ToolResultMetadata,
+}
+
+/// An entire MCP result's `_meta`, or a string marker when omitted due to the size limit.
+#[derive(Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ToolResultMetadata(Option<serde_json::Value>);
+
+impl std::fmt::Debug for ToolResultMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ToolResultMetadata([redacted])")
+    }
+}
+
+impl ToolResultMetadata {
+    /// Bounds serialization before cloning arbitrary MCP metadata; no keys are filtered.
+    pub fn new(metadata: &serde_json::Value) -> Self {
+        let mut limit = MetadataSizeLimit(MAX_EXECUTED_TOOL_CALL_METADATA_BYTES);
+        if serde_json::to_writer(&mut limit, metadata).is_ok() {
+            Self(Some(metadata.clone()))
+        } else {
+            Self::omitted_due_to_size_limit()
+        }
+    }
+
+    fn omitted_due_to_size_limit() -> Self {
+        // MCP `_meta` is an object; this string is a harness omission status, not provider data.
+        Self(Some(serde_json::Value::String(
+            "omitted_due_to_size_limit".to_string(),
+        )))
+    }
+
+    fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Whether the bounded snapshot contains metadata or an omission marker.
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+struct MetadataSizeLimit(usize);
+
+impl std::io::Write for MetadataSizeLimit {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or_else(|| std::io::Error::other("tool result metadata exceeds the byte limit"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A bounded capture update. Omitted updates still clear any previously recorded evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultSources(Option<Vec<ToolResultSource>>);
+
+impl ToolResultSources {
+    /// Deduplicates a captured snapshot, discarding all sources if it exceeds a limit.
+    /// Capture rules determine coverage; this is not a resource or permission inventory.
+    pub fn new(sources: Vec<ToolResultSource>) -> Self {
+        let mut unique_sources = Vec::new();
+        for source in sources {
+            if unique_sources.contains(&source) {
+                continue;
+            }
+            if unique_sources.len() == MAX_TOOL_RESULT_SOURCES
+                || source.r#type.len() > MAX_TOOL_RESULT_SOURCE_FIELD_BYTES
+                || source.id.len() > MAX_TOOL_RESULT_SOURCE_FIELD_BYTES
+            {
+                return Self(None);
+            }
+            unique_sources.push(source);
+        }
+        Self(Some(unique_sources))
+    }
+
+    /// Records a failed parse using the receiver's existing array-of-sources shape.
+    /// `parse_failed` is a status marker, not a resource type; the required ID is empty.
+    pub fn parse_failed() -> Self {
+        Self(Some(vec![ToolResultSource {
+            r#type: "parse_failed".to_string(),
+            id: String::new(),
+        }]))
+    }
+}
+
+/// A captured source ID, or a `parse_failed` status marker with an empty ID.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ToolResultSource {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub id: String,
 }
 
 /// Trusted truncation details generated locally for an oversized attempted tool call.
@@ -325,6 +500,8 @@ impl ExecutedToolCall {
         Self {
             name,
             arguments: ExecutedToolCallArguments::Raw(arguments),
+            tool_result_sources: None,
+            tool_result_metadata: ToolResultMetadata::default(),
         }
     }
 
@@ -338,6 +515,17 @@ impl ExecutedToolCall {
     /// Returns the raw arguments or locally generated truncation payload.
     pub fn arguments(&self) -> &ExecutedToolCallArguments {
         &self.arguments
+    }
+
+    /// Replaces this invocation's capture outcome, including clearing omitted evidence.
+    pub fn set_tool_result_sources(&mut self, sources: ToolResultSources) -> bool {
+        self.tool_result_sources = sources.0;
+        self.tool_result_sources.is_some()
+    }
+
+    /// Replaces the entire `_meta` snapshot, including with an omission marker if oversized.
+    pub fn set_tool_result_metadata(&mut self, metadata: ToolResultMetadata) {
+        self.tool_result_metadata = metadata;
     }
 
     fn truncation(&self) -> Option<&ExecutedToolCallTruncation> {
@@ -416,6 +604,18 @@ impl ResponseItem {
     /// Returns warehouse-only attempted-tool metadata for any supported item variant.
     pub fn executed_tool_call_metadata(&self) -> Option<&InternalChatMessageMetadataPassthrough> {
         self.internal_chat_message_metadata_passthrough()
+    }
+
+    /// Omits raw tool results without changing existing call, source or completion metadata.
+    pub fn clear_tool_result_metadata(&mut self) {
+        if let Some(metadata) = self
+            .internal_chat_message_metadata_passthrough_mut()
+            .and_then(Option::as_mut)
+        {
+            for call in metadata.executed_tool_calls.iter_mut().flatten() {
+                call.tool_result_metadata = ToolResultMetadata::default();
+            }
+        }
     }
 
     /// Bounds one request item's attempted calls to its share of the prompt budget.

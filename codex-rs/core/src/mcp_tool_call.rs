@@ -239,7 +239,7 @@ pub(crate) async fn handle_mcp_tool_call(
         let status = if result.is_ok() { "ok" } else { "error" };
         let outcome = McpCallMetricOutcome::from_status(status);
         emit_mcp_call_metrics(
-            turn_context.as_ref(),
+            &step_context.session_telemetry,
             &outcome,
             &server,
             &tool_name,
@@ -348,7 +348,7 @@ pub(crate) async fn handle_mcp_tool_call(
         let status = if result.is_ok() { "ok" } else { "error" };
         let outcome = McpCallMetricOutcome::from_status(status);
         emit_mcp_call_metrics(
-            turn_context.as_ref(),
+            &step_context.session_telemetry,
             &outcome,
             &server,
             &tool_name,
@@ -489,7 +489,7 @@ async fn handle_approved_mcp_tool_call(
                         .map(|(connector_id, action_name)| HostedFileUploadContext {
                             connector_id: connector_id.clone(),
                             action_name: action_name.clone(),
-                            model: turn_context.model_info().slug.clone(),
+                            model: step_context.settings.model_info.slug.clone(),
                         });
                     let rewritten_arguments = rewrite_mcp_tool_arguments_for_openai_files(
                         sess,
@@ -545,7 +545,7 @@ async fn handle_approved_mcp_tool_call(
             )
             .await;
             let result = sanitize_mcp_tool_result_for_model(
-                &turn_context.model_info().input_modalities,
+                &step_context.settings.model_info.input_modalities,
                 Ok(result),
             )?;
             Ok(maybe_request_codex_apps_auth_elicitation(
@@ -590,11 +590,11 @@ async fn handle_approved_mcp_tool_call(
         truncate_mcp_tool_result_for_event(&result),
     )
     .await;
-    maybe_track_codex_app_used(sess, turn_context, &server, &metadata).await;
+    maybe_track_codex_app_used(sess, step_context, &server, &metadata).await;
 
     let outcome = mcp_call_metric_outcome(&result);
     emit_mcp_call_metrics(
-        turn_context,
+        &step_context.session_telemetry,
         &outcome,
         &server,
         &tool_name,
@@ -1055,7 +1055,7 @@ async fn notify_mcp_tool_call_completed(
 
 async fn maybe_track_codex_app_used(
     sess: &Session,
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     server: &str,
     metadata: &McpToolApprovalMetadata,
 ) {
@@ -1075,8 +1075,9 @@ async fn maybe_track_codex_app_used(
         InvocationType::Implicit
     };
 
+    let turn_context = &step_context.turn;
     let tracking = build_track_events_context(
-        turn_context.model_info().slug.clone(),
+        step_context.settings.model_info.slug.clone(),
         sess.thread_id.to_string(),
         turn_context.sub_id.clone(),
         turn_context.originator.clone(),
@@ -1178,6 +1179,7 @@ impl Session {
 const MCP_TOOL_OPENAI_OUTPUT_TEMPLATE_META_KEY: &str = "openai/outputTemplate";
 const MCP_TOOL_UI_RESOURCE_URI_META_KEY: &str = "ui/resourceUri";
 const MCP_TOOL_LINK_ID_META_KEY: &str = "link_id";
+const MCP_TOOL_LINK_IS_IMPLICIT_META_KEY: &str = "link_is_implicit";
 const MCP_TOOL_PLUGIN_ID_META_KEY: &str = "plugin_id";
 const MCP_TOOL_ITEM_ID_META_KEY: &str = "itemId";
 const MCP_TOOL_THREAD_ID_META_KEY: &str = "threadId";
@@ -1373,6 +1375,7 @@ const MCP_TOOL_APPROVAL_CANCEL: &str = "Cancel";
 struct McpToolApprovalKey {
     server: String,
     connector_id: Option<String>,
+    link_id: Option<String>,
     tool_name: String,
 }
 
@@ -1566,10 +1569,14 @@ pub(crate) async fn request_mcp_tool_user_approval(
             .map(|rendered_template| rendered_template.question.as_str()),
     );
     if tool_call_mcp_elicitation_enabled {
+        let link_id = sess
+            .mcp_tool_approval_metadata(&turn_context.sub_id, id)
+            .await
+            .and_then(|(_, metadata)| metadata.link_id);
         let metadata = McpToolApprovalMetadata {
             annotations: None,
             connector_id: connector_id.clone(),
-            link_id: None,
+            link_id,
             connector_name: connector_name.clone(),
             connector_description: connector_description.clone(),
             connected_account_email: connected_account_email.clone(),
@@ -1614,7 +1621,7 @@ pub(crate) async fn request_mcp_tool_user_approval(
         .request_user_input(turn_context, call_id.to_string(), args)
         .await;
     normalize_approval_decision_for_mode(
-        parse_mcp_tool_approval_response(response, &question_id),
+        parse_mcp_tool_approval_response(response.map(|accepted| accepted.response), &question_id),
         *approval_mode,
     )
 }
@@ -1636,6 +1643,7 @@ fn session_mcp_tool_approval_key(
     Some(McpToolApprovalKey {
         server: invocation.server.clone(),
         connector_id,
+        link_id: metadata.and_then(|metadata| metadata.link_id.clone()),
         tool_name: invocation.tool.clone(),
     })
 }
@@ -1914,6 +1922,17 @@ fn build_mcp_tool_approval_elicitation_meta(
                 meta.insert(
                     MCP_TOOL_APPROVAL_CONNECTOR_ID_KEY.to_string(),
                     serde_json::Value::String(connector_id.to_string()),
+                );
+            }
+            if let Some(link_id) = metadata.link_id.as_ref() {
+                meta.insert(
+                    MCP_TOOL_LINK_ID_META_KEY.to_string(),
+                    serde_json::Value::String(link_id.clone()),
+                );
+                // Match the Codex Apps service's reserved implicit-link ID prefix.
+                meta.insert(
+                    MCP_TOOL_LINK_IS_IMPLICIT_META_KEY.to_string(),
+                    serde_json::Value::Bool(link_id.starts_with("implicit_link::")),
                 );
             }
             if let Some(connector_name) = metadata.connector_name.as_ref() {

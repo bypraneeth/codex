@@ -1,6 +1,7 @@
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexRuntimeMetadata;
 use crate::events::GuardianReviewEventParams;
+use crate::guardian_v2::GuardianV2Event;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::InitializeParams;
@@ -199,6 +200,7 @@ pub struct TurnResolvedConfigFact {
     pub service_tier: Option<ServiceTier>,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
+    pub guardian_v2_enabled: bool,
     pub sandbox_network_access: bool,
     pub collaboration_mode: ModeKind,
     pub personality: Option<Personality>,
@@ -432,7 +434,6 @@ pub enum CompactionReason {
 pub enum CompactionImplementation {
     Responses,
     ResponsesCompactionV2,
-    ResponsesCompact,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -564,7 +565,9 @@ pub(crate) enum CustomAnalyticsFact {
     SubAgentThreadStarted(SubAgentThreadStartedInput),
     Compaction(Box<CodexCompactionEvent>),
     Goal(Box<CodexGoalEvent>),
+    ThreadHintStatus(Box<crate::thread_hint::ThreadHintStatusEvent>),
     GuardianReview(Box<GuardianReviewEventParams>),
+    GuardianV2(Box<GuardianV2Event>),
     TurnResolvedConfig(Box<TurnResolvedConfigFact>),
     TurnTokenUsage(Box<TurnTokenUsageFact>),
     TurnProfile(Box<TurnProfileFact>),
@@ -600,6 +603,7 @@ pub struct PluginMeasurementsInput {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
+    pub originator: String,
     pub plugin_id: String,
     pub execution_id: String,
     pub operation: String,
