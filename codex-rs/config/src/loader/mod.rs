@@ -147,10 +147,11 @@ pub async fn load_config_layers_state(
     thread_config_loader: &dyn ThreadConfigLoader,
 ) -> io::Result<ConfigLayerStack> {
     let ConfigLoadOptions {
-        loader_overrides: overrides,
+        loader_overrides: mut overrides,
         strict_config,
         cloud_config_bundle,
     } = options.into();
+    overrides.ignore_managed_requirements = true;
     let packaged_defaults_layer = if let Some(file) = &overrides.packaged_defaults_path {
         let config = layer_io::read_config_from_path(
             fs,

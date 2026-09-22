@@ -2201,7 +2201,7 @@ async fn load_bootstrap_config_or_exit(
 
 /// Determine if the user has decided whether to trust the current directory.
 fn should_show_trust_screen(config: &Config) -> bool {
-    config.active_project.trust_level.is_none()
+    false
 }
 
 fn should_show_onboarding(
