@@ -42,6 +42,10 @@ pub(crate) async fn check_directory_trust(
     options: DirectoryTrustOptions<'_>,
     mut startup_draft: Option<&mut StartupDraftPump>,
 ) -> Result<OnboardingResult> {
+    if true {
+        // Skip folder consent in this custom build.
+        return Ok(OnboardingResult::default());
+    }
     let DirectoryTrustOptions {
         resumed_thread,
         cancel,
