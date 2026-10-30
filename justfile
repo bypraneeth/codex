@@ -41,6 +41,24 @@ code-mode-host *args:
 assemble-codex-package *args:
     {{ python }} {{ justfile_directory() }}/scripts/build_codex_package.py {args}
 
+[unix]
+[working-directory('..')]
+build-install-codex:
+    #!/usr/bin/env -S bash -eu
+    STABLE_GIT_COMMIT="$(git rev-parse --verify HEAD)"
+    export STABLE_GIT_COMMIT
+    mkdir -p dist
+    codex_build_dir="$(mktemp -d "$PWD/dist/.build-codex.XXXXXX")"
+    trap 'rm -rf "$codex_build_dir"' EXIT
+    bazel build --config=release --macos_minimum_os=14.0 //codex-rs/voice-host:codex-voice-host //third_party/voice:native_runtime
+    python3 scripts/build_codex_package.py --cargo-profile release --package-version "0.0.0+$STABLE_GIT_COMMIT" --package-dir "$codex_build_dir/base"
+    python3 third_party/voice/assemble_package.py --package "$codex_build_dir/base" \
+        --helper bazel-bin/codex-rs/voice-host/codex-voice-host --runtime bazel-bin/third_party/voice/native_runtime_macos_aarch64 \
+        --voice-target aarch64-apple-darwin --build-commit "$STABLE_GIT_COMMIT" --output "$codex_build_dir/complete"
+    test "$("$codex_build_dir/complete/codex-resources/voice/bin/codex-voice-host" --build-commit)" = "$STABLE_GIT_COMMIT"
+    [[ ! -d dist/codex-package ]] || chmod -R u+w dist/codex-package
+    rsync -a --delete-after "$codex_build_dir/complete/" dist/codex-package/
+
 # Build the CLI and run the app-server test client
 app-server-test-client *args:
     cargo build -p codex-cli
