@@ -51,7 +51,7 @@ build-install-codex:
     codex_build_dir="$(mktemp -d "$PWD/dist/.build-codex.XXXXXX")"
     trap 'rm -rf "$codex_build_dir"' EXIT
     bazel build --config=release --macos_minimum_os=14.0 //codex-rs/voice-host:codex-voice-host //third_party/voice:native_runtime
-    python3 scripts/build_codex_package.py --cargo-profile release --package-version "0.0.0+$STABLE_GIT_COMMIT" --package-dir "$codex_build_dir/base"
+    python3 scripts/build_codex_package.py --cargo-profile release --package-version "1.0.0+$STABLE_GIT_COMMIT" --package-dir "$codex_build_dir/base"
     python3 third_party/voice/assemble_package.py --package "$codex_build_dir/base" \
         --helper bazel-bin/codex-rs/voice-host/codex-voice-host --runtime bazel-bin/third_party/voice/native_runtime_macos_aarch64 \
         --voice-target aarch64-apple-darwin --build-commit "$STABLE_GIT_COMMIT" --output "$codex_build_dir/complete"
